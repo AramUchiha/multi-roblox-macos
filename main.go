@@ -2,15 +2,21 @@ package main
 
 import (
 	"io"
-	"os/exec"
+	"runtime"
 
 	"github.com/Insadem/multi-roblox-macos/internal/deeplink"
-	"github.com/Insadem/multi-roblox-macos/internal/infoplist"
 	"github.com/Insadem/multi-roblox-macos/internal/macosapp"
 	"github.com/Insadem/multi-roblox-macos/internal/robloxapp"
 	"github.com/Insadem/multi-roblox-macos/internal/syncbreaker"
 	"github.com/Insadem/multi-roblox-macos/internal/urlhandler"
 )
+
+// AppKit must run on the process's main thread. Locking here, during init,
+// pins the main goroutine to it; otherwise the cgo calls below can let the
+// scheduler move main() to another thread and NSApplication traps on launch.
+func init() {
+	runtime.LockOSThread()
+}
 
 func main() {
 	urlhandler.Set("com.insadem.multiroblox", "roblox-player")
@@ -20,10 +26,12 @@ func main() {
 		return
 	}
 
+	urls := deeplink.Handler() // registers the Apple Event handler; keep it on the main thread
+
 	cc := make(chan io.Closer)
 	func(cc chan<- io.Closer) {
 		go func() {
-			for url := range deeplink.Handler() {
+			for url := range urls {
 				copy, err := robloxapp.NewCopy()
 				if err != nil {
 					macosapp.Notification("can't make new app copy: " + err.Error())
@@ -34,19 +42,15 @@ func main() {
 					cc <- copy
 				}()
 
+				// Stop Roblox's updater from closing the clients already running,
+				// then remove the single-instance semaphore so the copy starts.
+				robloxapp.PrepareLaunch()
 				syncbreaker.Break()
-				err = exec.Command("open", "-a", copy.Path(), url).Run()
-				if err != nil {
+
+				if err := copy.Launch(url); err != nil {
 					macosapp.Notification("can't open roblox app copy: " + err.Error())
 					continue
 				}
-
-				err = infoplist.SetMultipleInstancesProhibition(copy.Path()+"/Contents/Info.plist", false)
-				if err != nil {
-					macosapp.Notification("can't set multi instance prohibition: " + err.Error())
-					continue
-				}
-				syncbreaker.Break()
 			}
 		}()
 	}(cc)
